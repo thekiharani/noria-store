@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import pytest
+from botocore.exceptions import ClientError
 
 from noria_store import StorageClient, StorageError, create_storage_client, join_storage_key
 
@@ -50,6 +51,7 @@ def test_storage_error_stores_metadata():
     assert with_cause.details == {"status": 500}
     assert without_cause.retryable is False
     assert without_cause.details is None
+    assert str(with_cause) == "boom"
 
 
 def test_join_storage_key_normalizes_repeated_separators_and_arrays():
@@ -57,6 +59,7 @@ def test_join_storage_key_normalizes_repeated_separators_and_arrays():
         join_storage_key(" invoices/ ", ["2026", "/march/"], "statement.pdf")
         == "invoices/2026/march/statement.pdf"
     )
+    assert join_storage_key("docs", object(), "file.txt") == "docs/file.txt"
 
 
 def test_constructor_applies_default_provider_region_url_style_and_ttls():
@@ -123,12 +126,6 @@ def test_put_object_applies_defaults_prefixes_tags_and_custom_key_resolution():
         "Metadata": {"visibility": "private", "source": "dashboard"},
         "Tagging": "project=noria&env=prod&kind=invoice",
         "ContentType": "application/octet-stream",
-        "CacheControl": None,
-        "ContentDisposition": None,
-        "ContentEncoding": None,
-        "ContentLanguage": None,
-        "ContentMD5": None,
-        "Expires": None,
         "Body": "file-contents",
     }
     assert result.key == "v1/tenant-a/uploads/reports/2026/march.pdf"
@@ -206,11 +203,17 @@ def test_head_object_returns_normalized_metadata_for_existing_objects():
 def test_head_object_defaults_missing_metadata_to_empty_object():
     client = StorageClient(
         bucket="media",
-        client=MockClient(head_object=lambda **_kwargs: {"ContentLength": 42}),
+        client=MockClient(
+            head_object=lambda **_kwargs: {
+                "ContentLength": 42,
+                "LastModified": datetime(2026, 3, 30, 12, 0, 0),
+            }
+        ),
     )
     result = client.head_object(key="images/raw.bin", public_url=False)
     assert result is not None
     assert result.metadata == {}
+    assert result.last_modified == "2026-03-30T12:00:00Z"
 
 
 def test_head_object_returns_null_for_not_found_and_wraps_when_requested():
@@ -235,6 +238,21 @@ def test_head_object_returns_null_for_not_found_and_wraps_when_requested():
         client.head_object(key="missing/file.txt", not_found="error")
     assert exc.value.code == "STORAGE_HEAD_FAILED"
     assert exc.value.status_code == 404
+
+
+def test_head_object_treats_botocore_not_found_as_missing():
+    client = StorageClient(
+        bucket="media",
+        client=MockClient(
+            head_object=lambda **_kwargs: (_ for _ in ()).throw(
+                ClientError(
+                    {"Error": {"Code": "NoSuchKey"}},
+                    "HeadObject",
+                )
+            )
+        ),
+    )
+    assert client.head_object(key="missing/from-botocore.txt") is None
 
 
 def test_head_object_wraps_generic_failures_and_object_exists_uses_null_path():
@@ -369,6 +387,38 @@ def test_create_presigned_upload_url_validates_expiry_bounds_and_wraps_failures(
     assert exc.value.retryable is True
 
 
+def test_create_presigned_download_url_uses_default_presigner_with_mock_client():
+    client = StorageClient(
+        bucket="signed-assets",
+        client=MockClient(
+            generate_presigned_url=lambda operation_name, *, Params, ExpiresIn: (
+                f"https://signed.example.com/{operation_name}"
+                f"?bucket={Params['Bucket']}&key={Params['Key']}&expires={ExpiresIn}"
+            )
+        ),
+    )
+    result = client.create_presigned_download_url(key="reports/march.pdf", expires_in=120)
+    assert result.url == (
+        "https://signed.example.com/get_object"
+        "?bucket=signed-assets&key=reports/march.pdf&expires=120"
+    )
+    assert result.headers == {}
+    assert result.expires_in == 120
+
+
+def test_create_presigned_download_url_wraps_failures():
+    client = StorageClient(
+        bucket="signed-assets",
+        presign_url=lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("signing failed")),
+        client=MockClient(generate_presigned_url=lambda *_args, **_kwargs: ""),
+    )
+    with pytest.raises(StorageError) as exc:
+        client.create_presigned_download_url(key="reports/march.pdf")
+    assert exc.value.code == "STORAGE_PRESIGN_DOWNLOAD_FAILED"
+    assert exc.value.operation == "createPresignedDownloadUrl"
+    assert exc.value.retryable is True
+
+
 def test_create_presigned_download_url_supports_default_presigner_with_boto_client():
     client = StorageClient(
         bucket="signed-assets",
@@ -445,6 +495,24 @@ def test_create_public_url_wraps_missing_provider_configuration():
     assert exc.value.code == "STORAGE_PUBLIC_URL_FAILED"
     assert exc.value.operation == "createPublicUrl"
     assert exc.value.provider == "r2"
+
+
+def test_create_public_url_re_raises_storage_errors_from_custom_builder():
+    original = StorageError(
+        "already normalized",
+        code="STORAGE_PUBLIC_URL_FAILED",
+        operation="createPublicUrl",
+        provider="s3",
+        bucket="assets",
+        key="report.pdf",
+    )
+    client = StorageClient(
+        bucket="assets",
+        build_public_url=lambda _resolved: (_ for _ in ()).throw(original),
+    )
+    with pytest.raises(StorageError) as exc:
+        client.create_public_url("report.pdf")
+    assert exc.value is original
 
 
 def test_non_string_nested_key_parts_are_ignored_during_normalization():

@@ -589,7 +589,7 @@ def _build_put_object_input(
     }
     if body is not None:
         result["Body"] = body
-    return result
+    return {k: v for k, v in result.items() if v is not None}
 
 
 def _build_presigned_put_headers(command: Mapping[str, Any]) -> dict[str, str]:
