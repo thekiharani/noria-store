@@ -1,6 +1,6 @@
 [project]
 name = "noria-store"
-version = "0.1.0"
+version = "0.1.1"
 description = "Configurable S3 and R2 storage client for Python services."
 readme = "README.md"
 requires-python = ">=3.11"
