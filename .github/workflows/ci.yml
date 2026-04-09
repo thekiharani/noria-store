@@ -72,7 +72,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          VERSION=$(python - <<'PY'
+          BASE_VERSION=$(python - <<'PY'
           from pathlib import Path
           import re
 
@@ -84,11 +84,36 @@ jobs:
           PY
           )
 
-          TAG_NAME="v${VERSION}"
+          IFS='.' read -r MAJOR MINOR BASE_PATCH <<< "${BASE_VERSION}"
+          LINE_TAG_PREFIX="v${MAJOR}.${MINOR}."
           git fetch --force --tags origin
+          LATEST_LINE_TAG=$(git tag --merged HEAD -l "${LINE_TAG_PREFIX}*" --sort=-v:refname | head -n 1)
+
+          if [ -z "${LATEST_LINE_TAG}" ]; then
+            NEW_PATCH="${BASE_PATCH}"
+          else
+            LATEST_PATCH="${LATEST_LINE_TAG##*.}"
+            if [ "${BASE_PATCH}" -gt "${LATEST_PATCH}" ]; then
+              NEW_PATCH="${BASE_PATCH}"
+            else
+              NEW_PATCH="$((LATEST_PATCH + 1))"
+            fi
+          fi
+
+          VERSION="${MAJOR}.${MINOR}.${NEW_PATCH}"
+          TAG_NAME="v${VERSION}"
 
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "tag_name=${TAG_NAME}" >> "$GITHUB_OUTPUT"
+
+          if [ -n "${LATEST_LINE_TAG}" ]; then
+            CHANGED_FILES=$(git diff --name-only "${LATEST_LINE_TAG}..HEAD" -- . ':(exclude).github/**')
+            if [ -z "${CHANGED_FILES}" ]; then
+              echo "Only GitHub configuration changed since ${LATEST_LINE_TAG}; skipping package release."
+              echo "should_release=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
 
           if git rev-parse -q --verify "refs/tags/${TAG_NAME}^{commit}" >/dev/null; then
             TAG_SHA=$(git rev-list -n 1 "${TAG_NAME}")
@@ -100,13 +125,7 @@ jobs:
               exit 0
             fi
 
-            if git merge-base --is-ancestor "${TAG_SHA}" "${HEAD_SHA}"; then
-              echo "Tag ${TAG_NAME} already exists on release history. Bump version in pyproject.toml before publishing a new release."
-              echo "should_release=false" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-
-            echo "Tag ${TAG_NAME} already exists on a different commit (${TAG_SHA}). Delete the stray tag or bump the package version."
+            echo "Tag ${TAG_NAME} already exists on a different commit (${TAG_SHA}). Delete the stray tag or adjust the base version line in pyproject.toml."
             exit 1
           fi
 
@@ -163,6 +182,27 @@ jobs:
           set -euo pipefail
           git fetch --force --tags origin
           git checkout "${TAG_NAME}"
+
+      - name: Update build version
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          import re
+
+          path = Path("pyproject.toml")
+          content = path.read_text()
+          version = "${{ needs.tag.outputs.version }}"
+          updated = re.sub(
+              r'(?m)^version = ".*"$',
+              f'version = "{version}"',
+              content,
+              count=1,
+          )
+          if updated != content:
+              path.write_text(updated)
+          PY
 
       - name: Setup Python
         uses: actions/setup-python@v6
